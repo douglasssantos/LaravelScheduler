@@ -2,18 +2,19 @@
 
 namespace App\Console\Commands;
 
-use Illuminate\Support\Facades\Artisan;
 use Illuminate\Console\Command;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Str;
-use ReflectionClass;
 use Symfony\Component\Console\Helper\Table;
 use Symfony\Component\Console\Helper\TableCell;
-use Symfony\Component\Console\Helper\TableSeparator;
 use Symfony\Component\Finder\Finder;
 
-class CronTab extends Command
+class crontab extends Command
 {
     /**
      * The name and signature of the console command.
@@ -25,12 +26,13 @@ class CronTab extends Command
     {--L|list : List all commands in the scheduler.}
     {--A|add : Add a task to the scheduler.}
     {--R|remove : Add a task to the scheduler.}
-    {--i|install : Install laravel scheduler in operating system crontab (only compatible with Linux).}
+    {--repair : repair possible errors in the crontab file.}
+    {--reset : Clean up crontab file and remove all commands.}
+    {--i|install : Install laravel scheduler in operational system crontab (only compatible with Linux).}
+    {--u|uninstall : remove the scheduler in the operational system crontab (only compatible with Linux).}
     {--s|start : start crontab from operational system.}
     {--p|stop : stop crontab from operational system.}
     {--r|restart : restart crontab from operational system.}';
-
-    protected static $scheduleCommand = "";
 
     /**
      * The console command description.
@@ -38,7 +40,17 @@ class CronTab extends Command
      * @var string
      */
     protected $description = 'Run commands for the operational system crontab.';
-    private mixed $instanceClassCommand = null;
+
+    protected static $user = '$USER:$USER';
+    protected static $path = "crontabs/";
+    protected static $filename = "schedule.cron";
+
+    public function __construct()
+    {
+        parent::__construct();
+
+        self::$path = storage_path(self::$path);
+    }
 
     /**
      * Execute the console command.
@@ -47,32 +59,297 @@ class CronTab extends Command
     {
         $this->clear();
         if($this->option("install")){ $this->clear()->install(); }
-        elseif($this->option("add")){ $this->clear()->add(); }
+        elseif($this->option("uninstall")){ $this->clear()->uninstall(); }
         elseif($this->option("list")){ $this->clear()->list(); }
+        elseif($this->option("add")){ $this->clear()->add(); }
+        elseif($this->option("remove")){ $this->clear()->remove(); }
+        elseif($this->option("repair")){ $this->clear()->repair(); }
+        elseif($this->option("reset")){ $this->clear()->reset(); }
         elseif($this->option("status")){ $this->clear()->status(); }
         elseif($this->option("start")){ $this->clear()->start(); }
         elseif($this->option("stop")){ $this->clear()->stop(); }
         elseif($this->option("restart")){ $this->clear()->restart(); }
         else{
-          $choice = $this->choice("Which option do you want to perform?",
-              ['install', 'status', 'add', 'list', 'start', 'stop', 'restart']);
+            $this->newLine();
+            $choice = $this->choice("Which option do you want to perform?",
+                [
+                    'list', 'add', 'remove',
+                    '<fg=blue>status</>', '<fg=green>start</>', '<fg=red>stop</>',
+                    '<fg=magenta>restart</>', '<fg=bright-cyan>repair</>', '<bg=red> reset </>',
+                    '<fg=default;bg=green> install </>', '<bg=bright-red> uninstall </>', "<fg=yellow>exit</>"
+                ], 0, 3);
+
+            $choice = str_replace([
+                " ", "blue", "green", "red",
+                "magenta", "bright-cyan", "default", "yellow", "<fg=>","</>"
+            ], "", $choice);
             call_user_func([$this, $choice]);
         }
+    }
+
+    public static function storage()
+    {
+        // Make sure the storage path exists and writeable
+        if (!is_writable(self::$path)) {
+
+            if(!is_dir(self::$path)) {
+                Process::run(sprintf("sudo mkdir %s && sudo chown %s %s/",
+                        self::$path, self::$user, self::$path));
+
+                (new crontab())->log()->info("Created Crontabs folder successfully");
+            }
+
+            if(!is_dir(self::$path)){
+                (new crontab())->log()->error("Failed to create Crontabs folder");
+                return new \Exception("Failed to create Crontabs folder");
+            }
+
+        }
+
+        return Storage::createLocalDriver(["root" => self::$path]);
+    }
+
+    public static function init(Schedule $schedule)
+    {
+
+        $storage = self::storage();
+
+        if(!$storage->fileExists(self::$filename)){
+
+            $storage->put(self::$filename, "");
+
+        }
+
+        $crons = file(self::$path.self::$filename);
+
+        foreach($crons as $cron){
+
+            $cron = str_replace("\n", "", $cron);
+
+            $cronParams = explode(" | ", $cron);
+
+            if((bool)$cronParams[2]) {
+
+                $prefixArtisan = "artisan";
+
+                if(str_contains($cronParams[1], $prefixArtisan)) {
+                    $cronParams[1] = strstr($cronParams[1], $prefixArtisan);
+                    $cronParams[1] = trim(str_replace($prefixArtisan, "", $cronParams[1]));
+                }
+
+                $schedule->command($cronParams[1])->cron($cronParams[0]);
+            }
+
+        }
+
+    }
+
+    public function getScheduledCommands(): bool|array
+    {
+        $storage = self::storage();
+
+        if(!$storage->fileExists(self::$filename)){
+
+            $storage->put(self::$filename, "");
+        }
+
+        return file(self::$path.self::$filename);
+    }
+
+    public function parameterizeCommand()
+    {
+        $command = $this->ask("Enter the command ?");
+
+        if(empty($command)) {
+            $this->error("Null commands are not allowed, enter a correct command !");
+            return $this->parameterizeCommand();
+        }
+
+        $minutes = $this->ask("Enter the minute (0 - 59) ?", "*");
+        $hours = $this->ask("Enter the hour (0 - 23) ?", "*");
+        $days = $this->ask("Enter the day of month (1 - 31) ?", "*");
+        $months = $this->ask("Enter the month (1 - 12) ?", "*");
+        $week = $this->ask("Enter the day of week? (0 - 6) ?", "*");
+
+        $active = (string)$this->confirm("Do you want to activate the command now?", true);
+
+        return "$minutes $hours $days $months $week | $command | " . ($active ? "true" : "false");
+
+    }
+
+    public function list($response = true)
+    {
+        $commands = [];
+
+        foreach($this->getScheduledCommands() as $cron) {
+            if(!empty($cron)) {
+
+                $cron = str_replace("\n", "", $cron);
+
+                $cronParams = explode(" | ", $cron);
+
+                if ($response) {
+
+                    $time = explode(" ", $cronParams[0]);
+
+                    $next = "<fg=red>Stopped</>";
+
+                    if ($cronParams[2] === "true") $next = "<fg=green>Running</>";
+
+                    $commands[] = [$cronParams[1], $time[0], $time[1], $time[2], $time[3], $time[4], $next];
+
+                } else {
+
+                    $commands[] = [
+                        'time' => $cronParams[0],
+                        'command' => $cronParams[1],
+                        'status' => $cronParams[2]
+                    ];
+
+                }
+            }
+        }
+
+        if(!$response) return $commands;
+
+        $this->newLine();
+        $checkParams = new Table($this->output);
+        $checkParams->setHeaderTitle("List of Commands in Laravel Scheduler");
+        $checkParams->setHeaders(['Command to be executed', 'Minutes', 'Hours', 'Days', 'Months', 'Week', "Status"]);
+
+        if(count($commands) > 0) {
+            $checkParams->setRows($commands);
+        }else{
+            $checkParams->setRows([[new TableCell('No command added to laravel scheduler', ['colspan' => 7])]]);
+        }
+
+        $checkParams->render();
+        $this->newLine();
+
+
+        $this->log()->info("Listed Commands: ".json_encode($commands));
+
+    }
+
+    public function add()
+    {
+        $this->newLine();
+        $this->info("<fg=default> Make sure you added the crontab::init(\$schedule); inside the kernel?\n </>");
+        $this->info("<fg=red> Method needed in Kernel to work:</>\n <fg=blue>crontab</><fg=default>::</><fg=yellow>init<fg=default>(</><fg=magenta>\$schedule</><fg=default>)</>;</>");
+        $this->newLine();
+
+        if(!$this->confirm("was added?", true)) return;
+
+        $params = $this->parameterizeCommand();
+
+        self::storage()->append(self::$filename, $params);
+
+        $this->log()->info("Command added : $params");
+
+    }
+
+    public function remove()
+    {
+        $storage = self::storage();
+
+        $commands = [];
+        foreach ($this->getScheduledCommands() as $cron){
+
+            $cron = str_replace("\n", "", $cron);
+
+            $cronParams = explode(" | ", $cron);
+
+            $next = "<fg=red>Stopped</>";
+
+            if($cronParams[2] === "true") $next = "<fg=green>Running</>";
+
+            $commands[] = "Time: <fg=green>".$cronParams[0]."</> | Command: <fg=magenta>" . $cronParams[1]."</> | Status: ".$next;
+        }
+
+        $commandChoice = $this->choice("Which command do you want to remove from the scheduler ?: \n", $commands);
+
+        $commandChoiceSelected = $commandChoice;
+
+        $cleanChoice = str_replace(['Time: ', "Command: ", "Status: ", "green", "magenta", "red", "<fg=>", "</>"],
+            "", $commandChoice);
+        $cleanChoice = str_replace(["| Running", "| Stopped"], ["| true", "| false"], $cleanChoice);
+
+        $crontabs = array_values(array_filter($this->getScheduledCommands(),
+            fn($line) => !str_contains($line, $cleanChoice) && !empty(trim($line))
+        ));
+
+        if($this->confirm("<fg=default>Command Selected: \n\n {$commandChoiceSelected}\n\n Really want to delete the selected command ?</>")) {
+
+            $this->info("Command removed: $commandChoiceSelected");
+            $this->log()->info("Command removed successfully.");
+
+            if($storage->put(self::$filename, join("", $crontabs))){
+                $this->restart();
+                $this->newLine(2);
+                $this->alert("Updated command list");
+                $this->log()->info("Updated command list.");
+                $this->list();
+            }
+        }
+    }
+
+    public function repair()
+    {
+        $crontabs = array_values(array_filter($this->getScheduledCommands(),
+            fn($line) => !empty(trim($line))
+        ));
+
+        $crontabs = array_unique($crontabs);
+
+        self::storage()->put(self::$filename, join("", $crontabs));
+
+        $this->log()->info("The crontab file has been repaired.");
+
+        $this->info("The crontab file has been repaired.");
+    }
+
+    public function reset()
+    {
+        self::storage()->put(self::$filename, "");
+        $this->info("The crontab file has been reset.");
+        $this->log()->info("The crontab file has been reset.");
+
     }
 
     public function install()
     {
         $this->newLine();
 
+        $isAlreadyInstalled = array_values(array_filter(file("/etc/crontab"),
+            fn($line) => str_contains($line, "/artisan schedule:run >> /dev/null 2>&1")));
+
+        if(count($isAlreadyInstalled) > 0 ) {
+
+            $this->alert("The scheduler is already installed to the operational system cronjob.");
+            $this->log()->info("The scheduler is already installed to the operational system cronjob.");
+
+            $this->newLine();
+            $this->line("<fg=white;bg=red> Attention: </></>\n<fg=yellow>Make sure you added the crontab method inside the kernel?</> ".
+                "<fg=blue>crontab</><fg=default>::</><fg=yellow>init<fg=default>(</><fg=magenta>\$schedule</><fg=default>)</>;</> "
+                ."\n<fg=yellow>must be added to the kernel inside the <fg=red>schedule()</> method,\n".
+                "the kernel is located at:</>  <fg=green>/app/Console/Kernel.php</>");
+            $this->newLine();
+            return ;
+        }
+
         $this->comment("Installing the laravel schedule in the operational system cron.");
+        $this->log()->info("Installing the laravel schedule in the operational system cron.");
+
 
         $cronTabFile = file_get_contents("/etc/crontab");
 
-        $cron = "*  *    * * *   root    cd ".base_path()." && php artisan schedule:run >> /dev/null 2>&1";
+        $cron = "*  *    * * *   root    php ".base_path()."/artisan schedule:run >> /dev/null 2>&1";
+        $this->log()->info($cron);
 
         if(str_contains($cronTabFile, $cron)) {
             $this->newLine();
             $this->error(" Could not install cron because it already exists and is active (running). ");
+            $this->log()->error("Could not install cron because it already exists and is active (running).");
             $this->newLine();
 
             $this->status();
@@ -86,15 +363,22 @@ class CronTab extends Command
 
         $this->newLine();
         $this->alert("Successfully active scheduler.");
+        $this->log()->info("Successfully active scheduler");
         $this->newLine();
+        $this->line("<fg=white;bg=green> Successfully: </></>\n<fg=yellow>For the scheduler to work, add the method:</> ".
+            "<fg=blue>crontab</><fg=default>::</><fg=yellow>init<fg=default>(</><fg=magenta>\$schedule</><fg=default>)</>;</> ".
+            "\n<fg=yellow>to the kernel inside the <fg=red>schedule()</> method,\n".
+            "the kernel is located at:</>  <fg=green>/app/Console/Kernel.php</>");
 
         if($this->status(true)) {
 
             $this->info("The operational system scheduler is running.");
+            $this->log()->info("The operational system scheduler is running.");
 
         }else{
 
             $this->error("The operating system scheduler is stopped (dead).");
+            $this->log()->error("The operating system scheduler is stopped (dead).");
 
             $this->newLine();
 
@@ -106,207 +390,44 @@ class CronTab extends Command
 
     }
 
-    public function add()
+    public function uninstall()
     {
-        $this->info(" Check if you added the scheduler properties to the created command ?");
         $this->newLine();
-        $this->line(" <fg=red>Example:</>");
-        $this->line(" <fg=yellow>protected</> <fg=magenta>\$scheduleCommand</> <fg=white>=</> <fg=green>\"migrate:fresh --seed\";</> <fg=red>(Required)</>");
-        $this->line(" <fg=yellow>protected</> <fg=magenta>\$scheduleTimer</> <fg=white>=</> <fg=green>\"25 * 5 * 1\";</> <fg=cyan>(Optional)</>");
 
-        if(!$this->confirm("was added?")) return;
+        $isAlreadyInstalled = array_values(array_filter(file("/etc/crontab"),
+            fn($line) => str_contains($line, "/artisan schedule:run >> /dev/null 2>&1")));
 
-        $paths = __DIR__;
+        if(count($isAlreadyInstalled) > 0 ) {
 
-        $paths = array_unique(Arr::wrap($paths));
+            if ($this->confirm("Do you really want to uninstall the scheduler?")) {
 
-        $paths = array_filter($paths, fn ($path) => is_dir($path));
+                $result = Process::run("sudo sed -i '/artisan schedule:run/d' /etc/crontab");
+                if ($this->option("verbose")) $this->line($result->output());
 
-        if (empty($paths)) return;
+                $this->restart();
 
-        $commands = [];
-
-        foreach ((new Finder)->in($paths)->files() as $command) {
-            $command = "App\\".str_replace( ['/', '.php'], ['\\', ''],
-                    Str::after($command->getRealPath(), realpath(app_path()).DIRECTORY_SEPARATOR)
-                );
-
-            if (is_subclass_of($command, Command::class) && !(new ReflectionClass($command))->isAbstract()) {
-
-                if(!empty($this->getClass($command)->command()))
-                    $commands = array_merge($commands, [$command]);
+                $this->info("scheduler successfully uninstalled.");
+                $this->log()->warning("Scheduler successfully uninstalled.");
 
             }
-        }
-
-        $commands = array_filter(array_filter($commands), fn($command) => !str_contains($command, "CronTab"));
-
-        $commandChoice = $this->choice("Which command do you want to add to the scheduler?", $commands);
-
-        $this->line("Selected command: <fg=green>{$commandChoice}</>");
-
-        $commandSelected = $this->getClass($commandChoice);
-
-        if(!empty($commandSelected->timer()) &&
-            $this->confirm(
-            "the command already has a scheduled time, do you want to use it in the scheduler?")) {
-
-            $timer = explode(" ", $commandSelected->timer());
-            $minutes = $timer[0];
-            $hours = $timer[1];
-            $days = $timer[2];
-            $months = $timer[3];
-            $week = $timer[4];
-
         }else{
-
-            $minutes = $this->ask("Enter the minute (0 - 59) ?", "*");
-            $hours = $this->ask("Enter the hour (0 - 23) ?", "*");
-            $days = $this->ask("Enter the day of month (1 - 31) ?", "*");
-            $months = $this->ask("Enter the month (1 - 12) ?", "*");
-            $week = $this->ask("Enter the day of week? (0 - 6) ?", "*");
-
-        }
-
-        $addCron = sprintf("\$schedule->command(\"%s\")->cron(\"%s %s %s %s %s\");",
-            $commandSelected->command(), $minutes, $hours, $days, $months, $week);
-
-
-        $this->newLine();
-
-        $checkParams = new Table($this->output);
-        $checkParams->setHeaderTitle("Laravel Scheduler");
-        $checkParams->setHeaders(['Command to be executed', 'minutes', 'hours', 'days', 'months', 'week']);
-        $checkParams->setRows([["artisan:{$commandSelected->command()}", $minutes, $hours, $days, $months, $week]]);
-        $checkParams->render();
-
-        if(!$this->confirm("Is the scheduler information correct?"))
-            return $this->clear()->add();
-
-        $kernel = str_replace("Commands","Kernel.php", __DIR__);
-
-        $getLine = array_values(array_filter(file($kernel), fn($line) => str_contains($line, $commandSelected->command())));
-        $getLine = str_replace("\n", "", trim($getLine[0]));
-
-        $updateFileKernel = str_replace($getLine, $addCron, file_get_contents($kernel));
-
-        $openFileKernel = fopen($kernel, "w+");
-
-        if(fwrite($openFileKernel, $updateFileKernel)){
-
-            $this->info("Command added to scheduler successfully.");
-
-        }else{
-
-            $this->error(" Failed to add command in scheduler. ");
-
-        }
-
-        fclose($openFileKernel);
-
-        Artisan::call("optimize:clear");
-        Artisan::call("optimize" );
-
-        $this->info(Artisan::output());
-
-    }
-
-    public function list()
-    {
-        $paths = __DIR__;
-
-        $paths = array_unique(Arr::wrap($paths));
-
-        $paths = array_filter($paths, fn ($path) => is_dir($path));
-
-        if (empty($paths)) return;
-
-        $commands = [];
-
-        $kernel = str_replace("Commands","Kernel.php", __DIR__);
-        $kernelContents = file_get_contents($kernel);
-
-        foreach ((new Finder)->in($paths)->files() as $command) {
-            $command = "App\\".str_replace( ['/', '.php'], ['\\', ''],
-                    Str::after($command->getRealPath(), realpath(app_path()).DIRECTORY_SEPARATOR)
-                );
-
-            if (is_subclass_of($command, Command::class) && !(new ReflectionClass($command))->isAbstract()) {
-
-                if(!empty($this->getClass($command)->command())) {
-
-                    $isCommandAdded = str_contains($kernelContents, $this->getClass($command)->command());
-
-                    if($isCommandAdded) {
-
-                        $isRunning = $isCommandAdded ? "active" : "unactive";
-
-                        $getLine = array_values(array_filter(file($kernel), fn($line) => str_contains($line, $this->getClass($command)->command())));
-                        $getLine = str_replace("\n", "", trim($getLine[0]));
-                        preg_match_all('/"(.*?)"/', $getLine, $match);
-
-                        $timer = explode(" ", $match[1][1]);
-
-                        $commands = array_merge($commands, [$match[1][0]], $timer, [$isRunning]);
-
-                    }
-                }
-
+            if ($this->confirm("<fg=yellow>The laravel scheduler is not installed.</>\n\n Do you want to install it?")) {
+                $this->install();
             }
         }
-
-        $this->newLine();
-        $checkParams = new Table($this->output);
-        $checkParams->setHeaderTitle("List of Commands in Laravel Scheduler");
-        $checkParams->setHeaders(['Command to be executed', 'minutes', 'hours', 'days', 'months', 'week', "status"]);
-
-        if(count($commands) > 0) {
-            $checkParams->setRows([$commands]);
-        }else{
-            $checkParams->setRows([[new TableCell('No command added to laravel scheduler', ['colspan' => 7])]]);
-        }
-
-        $checkParams->render();
-        $this->newLine();
-
-
-//        $getLine = array_values(array_filter(file($kernel), fn($line) => str_contains($line, $commandSelected->command())));
-//        $getLine = str_replace("\n", "", trim($getLine[0]));
-//        $updateFileKernel = str_replace($getLine, $addCron, file_get_contents($kernel));
-
-//        $openFileKernel = fopen($kernel, "w+");
-//
-//        if(fwrite($openFileKernel, $updateFileKernel)){
-//
-//            $this->info("Command added to scheduler successfully.");
-//
-//        }else{
-//
-//            $this->error(" Failed to add command in scheduler. ");
-//
-//        }
-//
-//        fclose($openFileKernel);
-//
-//        Artisan::call("optimize:clear");
-//        Artisan::call("optimize" );
-//
-//        $this->info(Artisan::output());
-
-
     }
 
-    public function status($returnBoolean = false)
+    public function status()
     {
-//        $this->comment("Checking status crontab.");
-
         $result = Process::run('service cron status');
 
         $output = $result->output();
 
         if(str_contains($output, "Active: active (running)")){
 
-            $this->info("Crontab Status: active (running).");
+            $this->newLine();
+            $this->info("<fg=default;bg=default> Crontab Status: </> active (running).");
+            $this->log()->info("Crontab Status: active (running)");
             $this->newLine();
 
             if($this->option("verbose")) $this->line($output);
@@ -315,7 +436,9 @@ class CronTab extends Command
 
         }elseif(str_contains($output, "Active: inactive (dead)")){
 
-            $this->error("Crontab Status: inactive (dead).");
+            $this->newLine();
+            $this->line("<fg=default;bg=default> Crontab Status:</> <fg=red> inactive (dead).</>");
+            $this->log()->alert("Crontab Status: inactive (dead)");
             $this->newLine();
 
             if($this->option("verbose")) $this->line($output);
@@ -325,56 +448,71 @@ class CronTab extends Command
         }
 
     }
+
     public function start()
     {
+        $this->newLine();
         $this->comment("Starting crontab.");
+        $this->log()->info("Starting crontab.");
 
         $result = Process::run('service cron start');
 
         if($this->status(true)) {
 
             $this->info("The operating system scheduler started successfully.");
+            $this->log()->info("The operating system scheduler started successfully.");
 
         }else{
 
             $this->error("Failed to initialize operating system scheduler.");
+            $this->log()->error("Failed to initialize operating system scheduler.");
 
         }
 
         if($this->option("verbose")) $this->line($result->output());
 
     }
+
     public function stop()
     {
-        $this->comment("stoping crontab.");
+        $this->newLine();
+        $this->comment("Stoping crontab.");
+        $this->log()->info("Stoping crontab.");
 
         $result = Process::run('service cron stop');
 
         if($this->status(true)) {
 
             $this->info("The operating system scheduler is stopped.");
+            $this->log()->info("The operating system scheduler is stopped.");
 
         }else{
 
             $this->error("Failed to kill operating system scheduler.");
+            $this->log()->error("Failed to kill operating system scheduler.");
 
         }
 
         if($this->option("verbose")) $this->line($result->output());
 
     }
+
     public function restart()
     {
+        $this->newLine();
         $this->comment("Restarting crontab.");
+        $this->log()->info("Restarting crontab.");
 
         $result = Process::run('service cron restart');
 
         if($this->status(true)) {
 
             $this->info("The operating system scheduler has been restarted.");
+            $this->log()->info("The operating system scheduler has been restarted.");
 
         }else{
 
+            $this->log()->error("Failed to restart operating system scheduler.");
             $this->error("Failed to restart operating system scheduler.");
 
         }
@@ -383,17 +521,10 @@ class CronTab extends Command
 
     }
 
-    public function getClass($namespace)
+    public function exit()
     {
-        return eval('return new class extends '.$namespace.' {
-                public function command(){
-                    return ($this->scheduleCommand ?? null);
-                }
-                public function timer(){
-                    return ($this->scheduleTimer ?? null);
-                }
-            };');
-
+        $this->clear();
+        return false;
     }
 
     public function clear()
@@ -405,5 +536,13 @@ class CronTab extends Command
         }
 
         return $this;
+    }
+
+    public function Log()
+    {
+        return Log::build([
+            'driver' => 'single',
+            'path' => storage_path('crontabs/schedule.log'),
+        ]);
     }
 }
