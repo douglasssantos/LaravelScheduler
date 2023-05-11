@@ -24,8 +24,8 @@ class crontab extends Command
     {--A|add : Add a command to the scheduler.}
     {--R|remove : Remove a command to the scheduler.}
     {--enable : Enable a command in the scheduler.}
-    {--all : selected all a command in the scheduler.}
     {--disable : Disable a command in the scheduler.}
+    {--all : selected all a command in the scheduler.}
     {--repair : repair possible errors in the crontab file.}
     {--reset : Clean up crontab file and remove all commands.}
     {--i|install : Install laravel scheduler in operational system crontab (only compatible with Linux).}
