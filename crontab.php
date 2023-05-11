@@ -3,16 +3,13 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Console\Scheduling\Schedule;
-use Illuminate\Support\Str;
 use Symfony\Component\Console\Helper\Table;
 use Symfony\Component\Console\Helper\TableCell;
-use Symfony\Component\Finder\Finder;
 
 class crontab extends Command
 {
@@ -24,8 +21,11 @@ class crontab extends Command
     protected $signature = 'crontab
     {--S|status : View operational system crontab status.}
     {--L|list : List all commands in the scheduler.}
-    {--A|add : Add a task to the scheduler.}
-    {--R|remove : Add a task to the scheduler.}
+    {--A|add : Add a command to the scheduler.}
+    {--R|remove : Remove a command to the scheduler.}
+    {--enable : Enable a command in the scheduler.}
+    {--all : selected all a command in the scheduler.}
+    {--disable : Disable a command in the scheduler.}
     {--repair : repair possible errors in the crontab file.}
     {--reset : Clean up crontab file and remove all commands.}
     {--i|install : Install laravel scheduler in operational system crontab (only compatible with Linux).}
@@ -57,12 +57,14 @@ class crontab extends Command
      */
     public function handle(): void
     {
-        $this->clear();
+        $this->clear()->repair();
         if($this->option("install")){ $this->clear()->install(); }
         elseif($this->option("uninstall")){ $this->clear()->uninstall(); }
         elseif($this->option("list")){ $this->clear()->list(); }
         elseif($this->option("add")){ $this->clear()->add(); }
         elseif($this->option("remove")){ $this->clear()->remove(); }
+        elseif($this->option("enable")){ $this->clear()->enable(); }
+        elseif($this->option("disable")){ $this->clear()->disable(); }
         elseif($this->option("repair")){ $this->clear()->repair(); }
         elseif($this->option("reset")){ $this->clear()->reset(); }
         elseif($this->option("status")){ $this->clear()->status(); }
@@ -73,7 +75,7 @@ class crontab extends Command
             $this->newLine();
             $choice = $this->choice("Which option do you want to perform?",
                 [
-                    'list', 'add', 'remove',
+                    'list', 'add', 'remove', 'enable', 'disable',
                     '<fg=blue>status</>', '<fg=green>start</>', '<fg=red>stop</>',
                     '<fg=magenta>restart</>', '<fg=bright-cyan>repair</>', '<bg=red> reset </>',
                     '<fg=default;bg=green> install </>', '<bg=bright-red> uninstall </>', "<fg=yellow>exit</>"
@@ -81,8 +83,9 @@ class crontab extends Command
 
             $choice = str_replace([
                 " ", "blue", "green", "red",
-                "magenta", "bright-cyan", "default", "yellow", "<fg=>","</>"
+                "magenta", "bright-cyan", "default", "yellow", "<fg=>", "<bg=>","</>"
             ], "", $choice);
+
             call_user_func([$this, $choice]);
         }
     }
@@ -148,7 +151,7 @@ class crontab extends Command
     {
         $storage = self::storage();
 
-        if(!$storage->fileExists(self::$filename)){
+        if(!file_exists(self::$path.self::$filename)){
 
             $storage->put(self::$filename, "");
         }
@@ -252,6 +255,13 @@ class crontab extends Command
     {
         $storage = self::storage();
 
+        if($this->option("all")) {
+            if($this->confirm("Do you really want to remove all commands?")){
+                $storage->put(self::$filename, "");
+            }
+            return;
+        }
+
         $commands = [];
         foreach ($this->getScheduledCommands() as $cron){
 
@@ -293,6 +303,90 @@ class crontab extends Command
         }
     }
 
+    public function enable()
+    {
+        $this->setStatus("activate");
+    }
+    public function disable()
+    {
+        $this->setStatus("unactivate");
+    }
+
+    public function setStatus($status)
+    {
+        $storage = self::storage();
+
+        if($this->option("all")) {
+            $commandEnabled = str_replace(
+                ($status === "activate" ? "| false" : "| true"),
+                ($status === "activate" ? "| true" : "| false"),
+                $storage->get(self::$filename));
+
+            $this->info("All commands {$status}d:");
+            $this->log()->info("All commands {$status}d successfully.");
+
+            if($storage->put(self::$filename, $commandEnabled)){
+                $this->restart();
+                $this->newLine(2);
+                $this->alert("Updated command list");
+                $this->log()->info("Updated command list.");
+                $this->list();
+            }
+
+            return;
+        }
+        $statusCheck = ($status === "activate" ? "| false" : "| true");
+        if(!str_contains($storage->get(self::$filename), $statusCheck)){
+            $this->newLine();
+            $this->comment("No command available to {$status}");
+            $this->newLine();
+            return;
+        }
+
+        $commands = [];
+        foreach ($this->getScheduledCommands() as $cron){
+
+            $cron = str_replace("\n", "", $cron);
+
+            $cronParams = explode(" | ", $cron);
+
+            $next = "<fg=red>Stopped</>";
+
+            if($cronParams[2] === "true") $next = "<fg=green>Running</>";
+
+            $commands[] = "Time: <fg=green>".$cronParams[0]."</> | Command: <fg=magenta>" . $cronParams[1]."</> | Status: ".$next;
+        }
+//        activate
+        $commandChoice = $this->choice("Select the command you want to {$status}: \n", $commands);
+
+        $commandChoiceSelected = $commandChoice;
+
+        $cleanChoice = str_replace(['Time: ', "Command: ", "Status: ", "green", "magenta", "red", "<fg=>", "</>"],
+            "", $commandChoice);
+        $cleanChoice = str_replace(["| Running", "| Stopped"], ["| true", "| false"], $cleanChoice)."\n";
+
+        $commandEnabled = str_replace($cleanChoice,
+            str_replace(
+                ($status === "activate" ?  "false" : "true"),
+                ($status === "activate" ?  "true" : "false"),
+                $cleanChoice),
+            $storage->get(self::$filename));
+
+        if($this->confirm("<fg=default>Command Selected: \n\n {$commandChoiceSelected}\n\n Really want to {$status} this command? ?</>")) {
+
+            $this->info("Command {$status}d: $commandChoiceSelected");
+            $this->log()->info("Command {$status}d successfully.");
+
+            if($storage->put(self::$filename, $commandEnabled)){
+                $this->restart();
+                $this->newLine(2);
+                $this->alert("Updated command list");
+                $this->log()->info("Updated command list.");
+                $this->list();
+            }
+        }
+    }
+
     public function repair()
     {
         $crontabs = array_values(array_filter($this->getScheduledCommands(),
@@ -304,7 +398,7 @@ class crontab extends Command
         self::storage()->put(self::$filename, join("", $crontabs));
 
         $this->log()->info("The crontab file has been repaired.");
-
+        if($this->option("verbose"))
         $this->info("The crontab file has been repaired.");
     }
 
@@ -517,7 +611,12 @@ class crontab extends Command
 
         }
 
-        if($this->option("verbose")) $this->line($result->output());
+        Artisan::call("optimize");
+
+        if($this->option("verbose")){
+            $this->line($result->output());
+            $this->line(Artisan::output());
+        }
 
     }
 
